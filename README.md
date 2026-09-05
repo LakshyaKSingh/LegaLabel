@@ -9,7 +9,6 @@
 ![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white)
 ![Supabase](https://img.shields.io/badge/Supabase-Postgres%20%7C%20Auth%20%7C%20Storage-3ECF8E?logo=supabase&logoColor=white)
 ![Groq](https://img.shields.io/badge/Groq-Vision%20AI-F55036?logoColor=white)
-![No Docker](https://img.shields.io/badge/Docker-not%20required-inactive)
 
 ---
 
@@ -53,14 +52,22 @@ reports to support the officer's own judgment, not replace it.
 
 ## Key Features
 
-- **Image-based label scanning** — upload a photo of a product's principal
-  display panel for automated analysis.
-- **OCR text & layout extraction** — detects every line of printed text on
-  the label along with its position and pixel dimensions.
+- **Zero manual data entry** — upload a front-of-pack photo and the product
+  name, brand, and category are identified automatically (via Groq vision,
+  with an OCR-based heuristic fallback) — nothing is typed in.
+- **Image-based label scanning** — upload a photo of the product's
+  declarations panel for automated compliance analysis.
+- **OCR text & layout extraction** — corrects phone EXIF rotation, upscales
+  and enhances the photo, then detects every line of printed text along
+  with its position and pixel dimensions. Tuned specifically for the
+  small/dense print on real product labels rather than scene text.
 - **Rule-based compliance engine** — deterministic, auditable matching of
   extracted text against the mandatory declarations required by the Rules,
   including the Second Schedule font-size thresholds for net quantity and
-  MRP.
+  MRP. A typo-tolerant fuzzy matching tier catches declarations OCR noise
+  would otherwise miss, before falling back to the optional AI vision check.
+- **Photo quality feedback** — flags a blurry or low-resolution photo
+  explicitly, rather than silently returning unreliable results.
 - **AI-assisted second opinion** — an optional vision-language model reviews
   the label photo directly, recovering declarations OCR misread and flagging
   legibility issues a pixel measurement alone would miss. It can only add
@@ -85,7 +92,7 @@ reports to support the officer's own judgment, not replace it.
 |---|---|
 | Frontend | React 18, Vite, Tailwind CSS 4, React Router, Recharts, Axios |
 | Backend | Python, FastAPI, SQLAlchemy |
-| OCR | EasyOCR (pure-pip, no external binary dependency) |
+| OCR | EasyOCR (pure-pip, no external binary dependency), OpenCV preprocessing, RapidFuzz for tolerant matching |
 | AI assist | Groq (vision-language model) |
 | PDF generation | ReportLab |
 | Database | Supabase Postgres (SQLite fallback for local dev) |
@@ -118,12 +125,18 @@ reports to support the officer's own judgment, not replace it.
    Supabase Auth, so switching identity providers never touched the
    frontend. Roles live in each Supabase user's `app_metadata`, writable
    only with the service-role key.
-2. **OCR** — EasyOCR extracts every line of text on the uploaded label, with
-   its bounding box and pixel height.
+2. **Preprocessing + OCR** — `image_preprocessing.py` corrects EXIF
+   rotation, upscales undersized photos, denoises, and contrast-enhances
+   the image; EasyOCR then extracts every line of text with its bounding
+   box and pixel height. Bounding boxes are scaled back to the original
+   photo's pixel space so a physical mm-per-pixel calibration still gives
+   correct font-size measurements after upscaling.
 3. **Rule engine** — a deterministic matcher (`rule_engine.py`) checks the
    extracted text against the mandatory declarations table
-   (`rules_data.py`), including a sliding-window match for declarations OCR
-   splits across lines, and the Second Schedule font-size thresholds.
+   (`rules_data.py`): first with regex and a sliding-window match for
+   declarations OCR splits across lines, then with a typo-tolerant fuzzy
+   match against each declaration's anchor keywords for text OCR garbled
+   too badly for regex, then the Second Schedule font-size thresholds.
 4. **AI assist (optional)** — if configured, Groq's vision model looks at
    the photo directly as a second opinion: recovering anything OCR missed,
    flagging visible legibility issues, and writing the report summary. It
@@ -236,13 +249,14 @@ Groq's model catalog changes over time — if a model id 404s, run
 
 1. **Sign in** as the seeded admin, or have an admin create inspector/viewer
    accounts from the **Users** page.
-2. **New Scan** — upload a clear photo of a product's principal display
-   panel. Optionally provide the panel's physical area (cm²) and a
-   calibration factor (mm per pixel — e.g. by photographing a ruler
-   alongside the label) so the font-size rule for net quantity can be
-   checked precisely. Without it, the system still checks presence and
-   correctness of every declaration, but marks font-size as "unverified"
-   rather than failing it.
+2. **New Scan** — upload two photos: the product's front (used to
+   auto-identify the product name, brand, and category — nothing is typed
+   in) and its declarations panel (checked for compliance). Optionally
+   provide the panel's physical area (cm²) and a calibration factor (mm per
+   pixel — e.g. by photographing a ruler alongside the label) so the
+   font-size rule for net quantity can be checked precisely. Without it,
+   the system still checks presence and correctness of every declaration,
+   but marks font-size as "unverified" rather than failing it.
 3. **Scan Detail** shows every mandatory declaration: whether it was found,
    the matched OCR text, measured vs. required font height, and a
    compliant/violation verdict per rule reference — plus a downloadable PDF
@@ -255,8 +269,8 @@ Groq's model catalog changes over time — if a model id 404s, run
 ## Deployment
 
 See **[DEPLOY.md](DEPLOY.md)** for the full production deployment guide —
-covers a VPS (systemd + Nginx) or Render for the backend, and Vercel/Netlify
-(or static Nginx) for the frontend, plus a post-deployment checklist and
+**Render** for the backend and **Vercel** (or Netlify) for the frontend, no
+server management or Docker required, plus a post-deployment checklist and
 troubleshooting for the exact issues this project has hit in practice
 (Supabase's IPv6-only direct connection, pooled-connection drops, CORS
 origin mismatches, and Groq model catalog changes).
@@ -272,12 +286,13 @@ backend is running. Summary of the main endpoints:
 | `GET` | `/auth/me` | Any role | Return the current authenticated user. |
 | `POST` | `/auth/users` | Admin | Create a new user with a given role. |
 | `GET` | `/auth/users` | Admin | List all users. |
-| `POST` | `/scans/` | Any role | Upload a label image and run the full compliance pipeline. |
+| `POST` | `/scans/` | Any role | Upload a front-of-pack photo (auto-identifies the product) and a declarations panel photo, and run the full compliance pipeline. |
 | `GET` | `/scans/` | Any role | List scans, filterable by status and searchable by product name. |
 | `GET` | `/scans/{id}` | Any role | Full detail for one scan, including all declarations. |
-| `GET` | `/scans/{id}/image` | Any role | The scan's label photo. |
+| `GET` | `/scans/{id}/image` | Any role | The scan's declarations panel photo. |
+| `GET` | `/scans/{id}/front-image` | Any role | The scan's front-of-pack photo. |
 | `GET` | `/scans/{id}/report` | Any role | Generate and download the scan's PDF compliance report. |
-| `DELETE` | `/scans/{id}` | Admin, Inspector | Delete a scan and its stored image. |
+| `DELETE` | `/scans/{id}` | Admin, Inspector | Delete a scan and both its stored images. |
 | `GET` | `/dashboard/stats` | Any role | Aggregate compliance rate, violation breakdown, and recent scans. |
 
 ## Compliance Rules Reference
@@ -326,9 +341,10 @@ SIH/
 │   │   │   ├── scans.py             Upload, list, detail, image, report, delete
 │   │   │   └── dashboard.py         Aggregate compliance statistics
 │   │   └── services/
-│   │       ├── ocr_service.py             EasyOCR text + bounding-box extraction
+│   │       ├── image_preprocessing.py      EXIF fix, upscaling, denoise, contrast enhancement
+│   │       ├── ocr_service.py               EasyOCR text + bounding-box extraction
 │   │       ├── rules_data.py               Mandatory declarations & font-size table
-│   │       ├── rule_engine.py               Deterministic compliance verdicts
+│   │       ├── rule_engine.py               Regex + fuzzy compliance verdicts
 │   │       ├── groq_service.py              Optional Groq vision AI-assist layer
 │   │       ├── report_generator.py          PDF compliance report generation
 │   │       ├── storage_service.py           Supabase Storage / local-disk abstraction
